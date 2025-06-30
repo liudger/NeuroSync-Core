@@ -1,13 +1,27 @@
-import gi, sys, time, logging
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GObject
+import sys, time, logging
 
-# Initialize GStreamer
 try:
-    Gst.init(None)
-except Exception as e:
-     logging.warning(f"GStreamer initialization failed: {e}. RTMP streaming will not work.")
-     # Allow the rest of the app to potentially run without GStreamer if RTMP isn't used.
+    import gi
+    gi.require_version('Gst', '1.0')
+    from gi.repository import Gst, GObject
+    GST_AVAILABLE = True
+    
+    # Initialize GStreamer
+    try:
+        Gst.init(None)
+    except Exception as e:
+        logging.warning(f"GStreamer initialization failed: {e}. RTMP streaming will not work.")
+        GST_AVAILABLE = False
+        
+except ImportError as e:
+    logging.warning(f"GStreamer not available: {e}. RTMP streaming will be disabled.")
+    GST_AVAILABLE = False
+    # Create dummy classes to prevent import errors
+    class Gst:
+        State = type('State', (), {'PLAYING': 4, 'NULL': 1})()
+        MessageType = type('MessageType', (), {'EOS': 1, 'ERROR': 2})()
+    class GObject:
+        pass
 
 logging.basicConfig(level=logging.INFO)
 # Default RTMP URL (can be overridden by environment variables)

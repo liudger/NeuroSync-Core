@@ -9,13 +9,16 @@ This Flask server provides endpoints for:
 It should be started with CUDA available if possible.
 """
 import base64 # Added for JSON serialization
+import flask
 import importlib
 import json
+import logging # Added for logging
 import os
 import queue
 import sys
 import threading
 import time
+import traceback
 from io import BytesIO
 import tempfile # Added for temporary audio files
 import logging # Added for logging
@@ -67,27 +70,35 @@ dotenv.load_dotenv()
 
 app = flask.Flask(__name__)
 
-# Check for CUDA availability and respect USE_CUDA environment variable
+# Check for hardware acceleration availability (CUDA, MPS, or CPU)
 use_cuda_env = os.getenv("USE_CUDA", "auto").lower()
 cuda_available = torch.cuda.is_available()
+mps_available = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
 
 if use_cuda_env == "true":
     if cuda_available:
         device = torch.device('cuda')
         print(f"{ColorText.GREEN}✅ Using CUDA GPU acceleration{ColorText.END}")
+    elif mps_available:
+        device = torch.device('mps')
+        print(f"{ColorText.GREEN}✅ Using MPS (Metal) acceleration for Apple Silicon{ColorText.END}")
     else:
         print(f"{ColorText.YELLOW}⚠️ CUDA requested but not available! Make sure PyTorch is installed with CUDA support and GPU drivers are updated.{ColorText.END}")
         print(f"{ColorText.YELLOW}⚠️ Falling back to CPU mode{ColorText.END}")
         device = torch.device('cpu')
 elif use_cuda_env == "false":
     device = torch.device('cpu')
-    print(f"{ColorText.CYAN}ℹ️ Using CPU mode (CUDA disabled by configuration){ColorText.END}")
+    print(f"{ColorText.CYAN}ℹ️ Using CPU mode (hardware acceleration disabled by configuration){ColorText.END}")
 else:  # "auto" or any other value
-    device = torch.device('cuda' if cuda_available else 'cpu')
     if cuda_available:
+        device = torch.device('cuda')
         print(f"{ColorText.GREEN}✅ Using CUDA GPU acceleration (auto-detected){ColorText.END}")
+    elif mps_available:
+        device = torch.device('mps')
+        print(f"{ColorText.GREEN}✅ Using MPS (Metal) acceleration for Apple Silicon (auto-detected){ColorText.END}")
     else:
-        print(f"{ColorText.CYAN}ℹ️ CUDA not available, using CPU mode{ColorText.END}")
+        device = torch.device('cpu')
+        print(f"{ColorText.CYAN}ℹ️ No hardware acceleration available, using CPU mode{ColorText.END}")
 
 print(f"{ColorText.BOLD}🔧 Activated device:{ColorText.END}", device)
 
@@ -97,13 +108,30 @@ model_path = os.path.join(root_dir, 'neurosync', 'core', 'model', 'model.pth')
 # Use the imported config object
 blendshape_model = load_model(model_path, config, device)
 
-# --- LiveLink Initialization ---
-print(f"{ColorText.BOLD}[LiveLink]{ColorText.END} Initializing PyFace and Socket Connection...")
-py_face = initialize_py_face()
-socket_connection = create_socket_connection()
-default_animation_thread = None # Initialize here
-stop_default_animation_event = stop_default_animation # Use the imported event
-print(f"{ColorText.BOLD}[LiveLink]{ColorText.END} Initialization complete.")
+# --- LiveLink Initialization (Optional) ---
+py_face = None
+socket_connection = None
+default_animation_thread = None
+stop_default_animation_event = None
+
+# Make LiveLink optional - if it fails, we can still use the API endpoints
+LIVELINK_ENABLED = os.getenv("LIVELINK_ENABLED", "false").lower() == "true"
+
+if LIVELINK_ENABLED:
+    print(f"{ColorText.BOLD}[LiveLink]{ColorText.END} Initializing PyFace and Socket Connection...")
+    try:
+        py_face = initialize_py_face()
+        socket_connection = create_socket_connection()
+        stop_default_animation_event = stop_default_animation # Use the imported event
+        print(f"{ColorText.BOLD}[LiveLink]{ColorText.END} Initialization complete.")
+    except Exception as e:
+        print(f"{ColorText.YELLOW}⚠️ [LiveLink] Failed to initialize: {e}{ColorText.END}")
+        print(f"{ColorText.YELLOW}⚠️ [LiveLink] LiveLink features disabled. API endpoints will still work.{ColorText.END}")
+        py_face = None
+        socket_connection = None
+        stop_default_animation_event = None
+else:
+    print(f"{ColorText.CYAN}ℹ️ [LiveLink] Disabled by configuration. API-only mode.{ColorText.END}")
 
 # --- Global Queues ---
 text_queue = queue.Queue()
@@ -346,7 +374,11 @@ app.register_blueprint(scb_bp, url_prefix='/scb')
 
 # --- NEW CORS CONFIG ---------------------------------------------------------
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*")
-CORS(app, resources={r"/scb/*": {"origins": allowed_origins}})
+# Allow CORS for all routes to enable frontend access
+CORS(app, resources={
+    r"/scb/*": {"origins": allowed_origins},
+    r"/*": {"origins": allowed_origins}  # Add CORS for all routes
+})
 
 # --- Worker Functions ---
 
@@ -694,18 +726,21 @@ def audio_to_blendshapes_route():
 
         sequence = BlendshapeSequence(fps=fps, sr=sr, frames=generated_facial_data_list)
 
-        # Send to LiveLink using the Player
-        try:
-            print(f"{ColorText.BLUE}[API /audio_to_blendshapes]{ColorText.END} Stopping default animation...")
-            stop_default_animation_event.set() # Use the imported event
-            player = Player(py_face, socket_connection, stop_default_animation_event) # Pass event
-            print(f"{ColorText.BLUE}[API /audio_to_blendshapes]{ColorText.END} Playing animation...")
-            player.play(audio_bytes, sequence) # Player handles restarting default animation
-            print(f"{ColorText.BLUE}[API /audio_to_blendshapes]{ColorText.END} Playback finished.")
-        except Exception as e:
-            print(f"{ColorText.RED}[API /audio_to_blendshapes] Error sending blendshapes to LiveLink: {e}{ColorText.END}")
-            # Ensure default animation restarts even on error
-            stop_default_animation_event.clear()
+        # Send to LiveLink using the Player (if LiveLink is enabled)
+        if py_face and socket_connection and stop_default_animation_event:
+            try:
+                print(f"{ColorText.BLUE}[API /audio_to_blendshapes]{ColorText.END} Stopping default animation...")
+                stop_default_animation_event.set() # Use the imported event
+                player = Player(py_face, socket_connection, stop_default_animation_event) # Pass event
+                print(f"{ColorText.BLUE}[API /audio_to_blendshapes]{ColorText.END} Playing animation...")
+                player.play(audio_bytes, sequence) # Player handles restarting default animation
+                print(f"{ColorText.BLUE}[API /audio_to_blendshapes]{ColorText.END} Playback finished.")
+            except Exception as e:
+                print(f"{ColorText.RED}[API /audio_to_blendshapes] Error sending blendshapes to LiveLink: {e}{ColorText.END}")
+                # Ensure default animation restarts even on error
+                stop_default_animation_event.clear()
+        else:
+            print(f"{ColorText.CYAN}[API /audio_to_blendshapes]{ColorText.END} LiveLink disabled - returning blendshapes only.")
 
         return jsonify({
             'sr': sequence.sr,
@@ -797,17 +832,20 @@ def text_to_blendshapes_route():
 
         print(f"{ColorText.BLUE}[API /text_to_blendshapes]{ColorText.END} Generated {len(full_audio_bytes)} audio bytes, {len(complete_sequence.frames)} blendshape frames.")
 
-        # Send to LiveLink using Player
-        try:
-            print(f"{ColorText.BLUE}[API /text_to_blendshapes]{ColorText.END} Stopping default animation...")
-            stop_default_animation_event.set()
-            player = Player(py_face, socket_connection, stop_default_animation_event)
-            print(f"{ColorText.BLUE}[API /text_to_blendshapes]{ColorText.END} Playing animation...")
-            player.play(full_audio_bytes, complete_sequence)
-            print(f"{ColorText.BLUE}[API /text_to_blendshapes]{ColorText.END} Playback finished.")
-        except Exception as e:
-            print(f"{ColorText.RED}[API /text_to_blendshapes] Error sending to LiveLink: {e}{ColorText.END}")
-            stop_default_animation_event.clear() # Ensure restart on error
+        # Send to LiveLink using Player (if LiveLink is enabled)
+        if py_face and socket_connection and stop_default_animation_event:
+            try:
+                print(f"{ColorText.BLUE}[API /text_to_blendshapes]{ColorText.END} Stopping default animation...")
+                stop_default_animation_event.set()
+                player = Player(py_face, socket_connection, stop_default_animation_event)
+                print(f"{ColorText.BLUE}[API /text_to_blendshapes]{ColorText.END} Playing animation...")
+                player.play(full_audio_bytes, complete_sequence)
+                print(f"{ColorText.BLUE}[API /text_to_blendshapes]{ColorText.END} Playback finished.")
+            except Exception as e:
+                print(f"{ColorText.RED}[API /text_to_blendshapes] Error sending to LiveLink: {e}{ColorText.END}")
+                stop_default_animation_event.clear() # Ensure restart on error
+        else:
+            print(f"{ColorText.CYAN}[API /text_to_blendshapes]{ColorText.END} LiveLink disabled - returning blendshapes only.")
 
         # Encode audio for JSON response
         encoded_audio = base64.b64encode(full_audio_bytes).decode('utf-8')
@@ -1026,17 +1064,20 @@ def main():
              print(f"{ColorText.YELLOW}⚠️ Error determining sample rate: {e}. Using default: {sample_rate} Hz.{ColorText.END}")
 
 
-        # --- Start Default Animation ---
-        print(f"{ColorText.GREEN}[Main]{ColorText.END} Starting default animation thread...")
-        if not default_animation_thread or not default_animation_thread.is_alive():
-            default_animation_thread = threading.Thread(
-                target=default_animation_loop,
-                args=(py_face, socket_connection), # Pass event
-                daemon=True
-            )
-            default_animation_thread.start()
+        # --- Start Default Animation (if LiveLink is enabled) ---
+        if py_face and socket_connection:
+            print(f"{ColorText.GREEN}[Main]{ColorText.END} Starting default animation thread...")
+            if not default_animation_thread or not default_animation_thread.is_alive():
+                default_animation_thread = threading.Thread(
+                    target=default_animation_loop,
+                    args=(py_face, socket_connection), # Pass event
+                    daemon=True
+                )
+                default_animation_thread.start()
+            else:
+                 print(f"{ColorText.YELLOW}[Main] Default animation thread already running.{ColorText.END}")
         else:
-             print(f"{ColorText.YELLOW}[Main] Default animation thread already running.{ColorText.END}")
+            print(f"{ColorText.CYAN}[Main]{ColorText.END} LiveLink disabled - skipping default animation thread.")
 
         # --- Start Playback Worker ---
         playback_device = os.getenv("AUDIO_PLAYBACK_DEVICE", "auto") # Allow selecting device via env var
