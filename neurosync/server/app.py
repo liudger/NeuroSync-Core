@@ -9,16 +9,13 @@ This Flask server provides endpoints for:
 It should be started with CUDA available if possible.
 """
 import base64 # Added for JSON serialization
-import flask
 import importlib
 import json
-import logging # Added for logging
 import os
 import queue
 import sys
 import threading
 import time
-import traceback
 from io import BytesIO
 import tempfile # Added for temporary audio files
 import logging # Added for logging
@@ -851,7 +848,7 @@ def text_to_blendshapes_route():
         encoded_audio = base64.b64encode(full_audio_bytes).decode('utf-8')
 
         return jsonify({
-            # "text": full_text_response, # Optionally return full LLM text
+            "text": full_text_response,  # Return the LLM-generated text
             "audio": encoded_audio,
             "sr": complete_sequence.sr,
             "fps": complete_sequence.fps,
